@@ -1,0 +1,567 @@
+#include "ns3/core-module.h"
+#include "ns3/mobility-module.h"
+#include "ns3/flow-monitor-helper.h"
+#include "ns3/netanim-module.h"
+#include "ns3/internet-module.h"
+#include "ns3/nr-module.h"
+#include "ns3/ipv4-flow-classifier.h"
+#include <ns3/antenna-module.h>
+#include "ns3/udp-client-server-helper.h"
+#include "ns3/nr-point-to-point-epc-helper.h"
+#include "ns3/point-to-point-helper.h"
+#include <ns3/buildings-helper.h>
+#include <ns3/nr-phy.h> // Include necessary for PHY access
+#include "ns3/nr-spectrum-phy.h"
+#include "ns3/pcap-file-wrapper.h" // Required for PcapHelper
+#include "ns3/trace-helper.h"
+// Headers needed for connectivity check, lists, maps
+#include <map>
+#include <iomanip> // For std::hex/dec output formatting
+#include <vector>  // For attacker/victim lists
+#include <set>     // For easy lookup
+#include <sstream> // For NetAnim descriptions, FlowMonitor classification
+#include "ns3/nstime.h" // For ns3::Time
+#include "ns3/log.h"    // For NS_LOG_UNCOND, LogComponentEnable
+#include "ns3/uinteger.h" // For UintegerValue
+// Note: Removed Packet.h, nr-phy-rx-trace-params.h, nr-radio-bearer-tag.h as they were primarily for the detector
+// ns3/object.h might still be needed by other parts of ns-3, so keeping it is safer.
+
+#include <iostream>
+
+
+using namespace ns3;
+
+// ... [all your includes remain unchanged] ...
+
+using namespace ns3;
+
+// --- Helper Functions ---
+bool IsIndexInList(uint16_t indexToCheck, const std::vector<uint16_t>& indexList)
+{
+    for (uint16_t item : indexList)
+    {
+        if (indexToCheck == item) return true;
+    }
+    return false;
+}
+
+bool IsAddressInList(ns3::Ipv4Address addrToCheck,
+                     const ns3::Ipv4InterfaceContainer& ueIpIfContainer,
+                     const std::vector<uint16_t>& indicesToCheck,
+                     const ns3::NodeContainer&)
+{
+    for (uint16_t index : indicesToCheck) {
+        if (index < ueIpIfContainer.GetN()) {
+            ns3::Ipv4Address ueAddr = ueIpIfContainer.GetAddress(index);
+            if (addrToCheck == ueAddr) return true;
+        }
+    }
+    return false;
+}
+
+int main(int argc, char *argv[])
+{
+    LogComponentEnable("AnimationInterface", LOG_LEVEL_INFO);
+    LogComponentEnable("FlowMonitor", LOG_LEVEL_INFO);
+
+    double frequency = 28e9;
+    double bandwidth = 100e6;
+    double hBS = 25;
+    double hUT = 1.5;
+    double txPowerMacro = 40.0;
+    bool mobility = false;
+    BandwidthPartInfo::Scenario scenario = BandwidthPartInfo::UMa;
+    uint16_t numUes = 15;
+    uint16_t numMacroGnb = 2;
+    Time simStopTime = Seconds(30.0);
+    double ueTxPower = 23.0;
+    uint16_t numFaps = 2;
+    double hFAP = 5.0;
+    double txPowerFAP = 20.0;
+    uint16_t ulPort = 20000;
+    uint16_t dlPort = 10000;
+
+    // --- DDoS Attack Parameters ---
+    std::vector<uint16_t> attackerUeIndices = {2, 3};
+    std::vector<uint16_t> fapLegitUeIndices = {0, 1};
+    std::vector<uint16_t> macroLegitUeIndices;
+    std::set<uint16_t> attackerSet(attackerUeIndices.begin(), attackerUeIndices.end());
+    std::set<uint16_t> fapLegitSet(fapLegitUeIndices.begin(), fapLegitUeIndices.end());
+    for(uint16_t i=0; i<numUes; ++i)
+    {
+        if(attackerSet.find(i) == attackerSet.end() && fapLegitSet.find(i) == fapLegitSet.end())
+            macroLegitUeIndices.push_back(i);
+    }
+    Time ddosStartTime = Seconds(10.0);
+    Time ddosStopTime = Seconds(25.0);
+    Time attackerInterval = MicroSeconds(20);
+    uint32_t attackerPacketSize = 1024;
+
+    // --- Setup ---
+    NodeContainer vehicles;
+    NodeContainer macroGnbNodes;
+    NodeContainer fapNodes;
+    vehicles.Create(numUes);
+    macroGnbNodes.Create(numMacroGnb);
+    fapNodes.Create(numFaps);
+
+    // --- Mobility ---
+    NS_ASSERT_MSG(!mobility, "Mobility must be disabled for predictable UE-FAP association");
+    Ptr<ListPositionAllocator> macroEnbPositionAlloc = CreateObject<ListPositionAllocator>();
+    macroEnbPositionAlloc->Add(Vector(0.0, 0.0, hBS));
+    if (numMacroGnb > 1)
+        macroEnbPositionAlloc->Add(Vector(0.0, 80.0, hBS));
+    MobilityHelper macroEnbmobility;
+    macroEnbmobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
+    macroEnbmobility.SetPositionAllocator(macroEnbPositionAlloc);
+    macroEnbmobility.Install(macroGnbNodes);
+
+    Ptr<ListPositionAllocator> fapPositionAlloc = CreateObject<ListPositionAllocator>();
+    fapPositionAlloc->Add(Vector(40.0, 5.0, hFAP));
+    if (numFaps > 1)
+       fapPositionAlloc->Add(Vector(35.0, 45.0, hFAP));
+    MobilityHelper fapmobility;
+    fapmobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
+    fapmobility.SetPositionAllocator(fapPositionAlloc);
+    fapmobility.Install(fapNodes);
+
+    MobilityHelper uemobility;
+    uemobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
+    uemobility.Install(vehicles);
+    if (numUes >= 1)
+        vehicles.Get(0)->GetObject<MobilityModel>()->SetPosition(Vector(42, 3, hUT));
+    if (numUes >= 2)
+        vehicles.Get(1)->GetObject<MobilityModel>()->SetPosition(Vector(37, 42, hUT));
+    if (numUes >= 3)
+        vehicles.Get(2)->GetObject<MobilityModel>()->SetPosition(Vector(38, 7, hUT));
+    if (numUes >= 4)
+        vehicles.Get(3)->GetObject<MobilityModel>()->SetPosition(Vector(33, 47, hUT));
+    double macro_x_start = -10.0;
+    double macro_y_start = -10.0;
+    double macro_spacing = 15.0;
+    uint16_t macro_cols = 4;
+    for(uint16_t list_idx = 0; list_idx < macroLegitUeIndices.size(); ++list_idx)
+    {
+        uint16_t ue_idx = macroLegitUeIndices[list_idx];
+        if (ue_idx < numUes)
+        {
+            double x_pos = macro_x_start + (list_idx % macro_cols) * macro_spacing;
+            double y_pos = macro_y_start + (list_idx / macro_cols) * macro_spacing;
+            vehicles.Get(ue_idx)->GetObject<MobilityModel>()->SetPosition(Vector(x_pos, y_pos, hUT));
+        }
+    }
+
+    // --- NR Setup ---
+    Ptr<NrPointToPointEpcHelper> epcHelper = CreateObject<NrPointToPointEpcHelper>();
+    Ptr<IdealBeamformingHelper> idealBeamformingHelper = CreateObject<IdealBeamformingHelper>();
+
+    Ptr<NrHelper> nrHelper = CreateObject<NrHelper>();
+    nrHelper->SetBeamformingHelper(idealBeamformingHelper);
+    nrHelper->SetEpcHelper(epcHelper);
+    BandwidthPartInfoPtrVector allBwps;
+
+    CcBwpCreator ccBwpCreator;
+    const uint8_t numCcPerBand = 1;
+    CcBwpCreator::SimpleOperationBandConf bandConf(frequency, bandwidth, numCcPerBand, scenario);
+    OperationBandInfo band = ccBwpCreator.CreateOperationBandContiguousCc(bandConf);
+    nrHelper->InitializeOperationBand(&band); allBwps = CcBwpCreator::GetAllBwps({band});
+
+    idealBeamformingHelper->SetAttribute("BeamformingMethod", TypeIdValue(DirectPathBeamforming::GetTypeId()));
+    nrHelper->SetSchedulerTypeId(NrMacSchedulerTdmaRR::GetTypeId());
+
+    nrHelper->SetUeAntennaAttribute("NumRows", UintegerValue(2));
+    nrHelper->SetUeAntennaAttribute("NumColumns", UintegerValue(4));
+    nrHelper->SetUeAntennaAttribute("AntennaElement", PointerValue(CreateObject<IsotropicAntennaModel>()));
+
+    nrHelper->SetGnbAntennaAttribute("NumRows", UintegerValue(8));
+    nrHelper->SetGnbAntennaAttribute("NumColumns", UintegerValue(8));
+    nrHelper->SetGnbAntennaAttribute("AntennaElement", PointerValue(CreateObject<IsotropicAntennaModel>()));
+
+    std::cout << "Installing NR Devices on UEs, Macro gNBs, and FAPs..." << std::endl;
+    NetDeviceContainer ueNetDevices = nrHelper->InstallUeDevice(vehicles, allBwps);
+    NetDeviceContainer macroGnbNetDevices = nrHelper->InstallGnbDevice(macroGnbNodes, allBwps);
+    NetDeviceContainer fapNetDevices = nrHelper->InstallGnbDevice(fapNodes, allBwps);
+
+    std::cout << "Setting Tx Power..." << std::endl;
+    for(uint32_t i=0; i<macroGnbNetDevices.GetN(); ++i)
+    {
+        Ptr<NrGnbNetDevice> gnbDev=DynamicCast<NrGnbNetDevice>(macroGnbNetDevices.Get(i));
+        if(gnbDev&&gnbDev->GetPhy(0))
+          gnbDev->GetPhy(0)->SetTxPower(txPowerMacro);
+    }
+    for(uint32_t i=0; i<fapNetDevices.GetN(); ++i)
+    {
+        Ptr<NrGnbNetDevice> gnbDev=DynamicCast<NrGnbNetDevice>(fapNetDevices.Get(i));
+        if(gnbDev&&gnbDev->GetPhy(0))
+         gnbDev->GetPhy(0)->SetTxPower(txPowerFAP);
+    }
+
+    for(uint32_t i=0; i<ueNetDevices.GetN(); ++i)
+    {
+        Ptr<NrUeNetDevice> ueDev=DynamicCast<NrUeNetDevice>(ueNetDevices.Get(i));
+        if(ueDev&&ueDev->GetPhy(0))
+          ueDev->GetPhy(0)->SetTxPower(ueTxPower);
+    }
+
+    int64_t randomStream = 1;
+    randomStream += nrHelper->AssignStreams(macroGnbNetDevices, randomStream);
+    randomStream += nrHelper->AssignStreams(fapNetDevices, randomStream);
+    randomStream += nrHelper->AssignStreams(ueNetDevices, randomStream);
+
+    std::cout << "Updating NR device configurations..." << std::endl;
+
+    for(auto it=macroGnbNetDevices.Begin();
+     it!=macroGnbNetDevices.End(); ++it)
+    DynamicCast<NrGnbNetDevice>(*it)->UpdateConfig();
+
+    for(auto it=fapNetDevices.Begin(); it!=fapNetDevices.End(); ++it)
+     DynamicCast<NrGnbNetDevice>(*it)->UpdateConfig();
+    for(auto it=ueNetDevices.Begin();
+      it!=ueNetDevices.End(); ++it)
+    DynamicCast<NrUeNetDevice>(*it)->UpdateConfig();
+
+    std::map<uint16_t, Ptr<Node>> cellIdToNodeMap;
+    std::cout << "Building Cell ID to Node map..." << std::endl;
+    for(uint32_t i=0; i<macroGnbNetDevices.GetN(); ++i)
+    {
+        Ptr<NrGnbNetDevice> gnbDev=DynamicCast<NrGnbNetDevice>(macroGnbNetDevices.Get(i));
+        if(gnbDev)
+         cellIdToNodeMap[gnbDev->GetCellId()]=macroGnbNodes.Get(i);
+    }
+    for(uint32_t i=0; i<fapNetDevices.GetN(); ++i)
+    {
+        Ptr<NrGnbNetDevice> fapDev=DynamicCast<NrGnbNetDevice>(fapNetDevices.Get(i));
+        if(fapDev)
+         cellIdToNodeMap[fapDev->GetCellId()]=fapNodes.Get(i);
+    }
+
+    // --- Internet & Core Network ---
+    Ptr<Node> pgw=epcHelper->GetPgwNode();
+    NodeContainer remoteHostContainer;
+    remoteHostContainer.Create(1);
+    Ptr<Node> remoteHost=remoteHostContainer.Get(0);
+    InternetStackHelper internet; internet.Install(remoteHostContainer);
+
+    PointToPointHelper p2ph;
+    p2ph.SetDeviceAttribute("DataRate", DataRateValue(DataRate("100Gb/s")));
+    p2ph.SetDeviceAttribute("Mtu", UintegerValue(2500));
+    p2ph.SetChannelAttribute("Delay", TimeValue(Seconds(0.010)));
+    NetDeviceContainer internetDevices=p2ph.Install(pgw, remoteHost);
+
+    // --- Enable PCAP tracing for DDoS analysis ---
+    p2ph.EnablePcapAll("ddos-p2p"); // <--- ADD THIS LINE [2][3][5][6]
+
+    Ipv4AddressHelper ipv4h; ipv4h.SetBase("1.0.0.0", "255.0.0.0");
+    Ipv4InterfaceContainer internetIpIfaces=ipv4h.Assign(internetDevices);
+    Ipv4Address remoteHostAddr=internetIpIfaces.GetAddress(1);
+
+    Ipv4StaticRoutingHelper ipv4RoutingHelper;
+    Ptr<Ipv4StaticRouting> remoteHostStaticRouting=ipv4RoutingHelper.GetStaticRouting(remoteHost->GetObject<Ipv4>());
+    remoteHostStaticRouting->AddNetworkRouteTo(Ipv4Address("7.0.0.0"), Ipv4Mask("255.0.0.0"), 1);
+
+    internet.Install(vehicles);
+    internet.Install(macroGnbNodes);
+    internet.Install(fapNodes);
+
+    Ptr<ListPositionAllocator> fixedAlloc=CreateObject<ListPositionAllocator>();
+    fixedAlloc->Add(Vector(100.0, 100.0, 0));
+    fixedAlloc->Add(Vector(120.0, 100.0, 0));
+    MobilityHelper fixedMobility; fixedMobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
+    fixedMobility.SetPositionAllocator(fixedAlloc);
+    fixedMobility.Install(NodeContainer(pgw, remoteHost));
+
+    Ipv4InterfaceContainer ueIpIface = epcHelper->AssignUeIpv4Address(NetDeviceContainer(ueNetDevices));
+
+    NetDeviceContainer allGnbNetDevices;
+    allGnbNetDevices.Add(macroGnbNetDevices);
+    allGnbNetDevices.Add(fapNetDevices);
+
+    std::cout << "Attaching UEs to the closest gNB (Macro or FAP)..." << std::endl;
+    nrHelper->AttachToClosestGnb(ueNetDevices, allGnbNetDevices);
+
+    for(uint32_t u=0; u<vehicles.GetN(); ++u)
+    {
+        Ptr<Ipv4StaticRouting> ueStaticRouting=ipv4RoutingHelper.GetStaticRouting(vehicles.Get(u)->GetObject<Ipv4>());
+        ueStaticRouting->SetDefaultRoute(epcHelper->GetUeDefaultGatewayAddress(), 1);
+    }
+
+    // --- Legitimate Downlink Applications ---
+    std::cout << "Setting up Legitimate Downlink Traffic (RemoteHost -> Legitimate UEs on port " << dlPort << ")" << std::endl;
+    ApplicationContainer downlinkServers, downlinkClients;
+
+    for(uint16_t i=0; i<vehicles.GetN(); ++i)
+    {
+        UdpServerHelper dlServerHelper(dlPort);
+        ApplicationContainer serverApp=dlServerHelper.Install(vehicles.Get(i));
+        serverApp.Start(Seconds(0.0));
+        serverApp.Stop(simStopTime);
+        downlinkServers.Add(serverApp);
+    }
+
+    std::vector<uint16_t> allLegitUeIndices = fapLegitUeIndices;
+    allLegitUeIndices.insert(allLegitUeIndices.end(), macroLegitUeIndices.begin(), macroLegitUeIndices.end());
+
+    for(uint16_t i : allLegitUeIndices)
+    {
+        if (i < ueIpIface.GetN())
+        {
+            UdpClientHelper dlClientHelper(ueIpIface.GetAddress(i), dlPort);
+            dlClientHelper.SetAttribute("MaxPackets", UintegerValue(0xFFFFFFFF));
+            dlClientHelper.SetAttribute("Interval", TimeValue(MilliSeconds(100)));
+            dlClientHelper.SetAttribute("PacketSize", UintegerValue(1024));
+            ApplicationContainer clientApp=dlClientHelper.Install(remoteHost);
+            clientApp.Start(Seconds(1.0)); clientApp.Stop(simStopTime - Seconds(1.0));
+            downlinkClients.Add(clientApp);
+        }
+    }
+
+    // --- Uplink Applications (Legitimate AND DDoS Attack Traffic) ---
+    std::cout << "Setting up Uplink Traffic (Including DDoS Attack)..." << std::endl;
+    UdpServerHelper ulServerHelper(ulPort);
+    ApplicationContainer ulServerApp = ulServerHelper.Install(remoteHost);
+    ulServerApp.Start(Seconds(0.0)); ulServerApp.Stop(simStopTime);
+
+    ApplicationContainer uplinkClients;
+    for (uint16_t i = 0; i < vehicles.GetN(); ++i) {
+        if (IsIndexInList(i, attackerUeIndices)) { // Attacker UE
+             std::cout << "  Configuring Attacker UE " << i << " to flood RemoteHost " << remoteHostAddr << ":" << ulPort << std::endl;
+             UdpClientHelper attackerClientHelper(remoteHostAddr, ulPort);
+             attackerClientHelper.SetAttribute("MaxPackets", UintegerValue(0xFFFFFFFF));
+             attackerClientHelper.SetAttribute("Interval", TimeValue(attackerInterval));
+             attackerClientHelper.SetAttribute("PacketSize", UintegerValue(attackerPacketSize));
+             ApplicationContainer attackerApp = attackerClientHelper.Install(vehicles.Get(i));
+             attackerApp.Start(ddosStartTime);
+             attackerApp.Stop(ddosStopTime);
+             uplinkClients.Add(attackerApp);
+        } else { // Legitimate UE
+            std::cout << "  Configuring Legitimate Uplink Client on UE " << i << " to " << remoteHostAddr << ":" << ulPort << std::endl;
+            UdpClientHelper ulClientHelper(remoteHostAddr, ulPort);
+            ulClientHelper.SetAttribute("MaxPackets", UintegerValue(0xFFFFFFFF));
+            ulClientHelper.SetAttribute("Interval", TimeValue(MilliSeconds(120)));
+            ulClientHelper.SetAttribute("PacketSize", UintegerValue(512));
+            ApplicationContainer ulClientApp = ulClientHelper.Install(vehicles.Get(i));
+            ulClientApp.Start(Seconds(1.5));
+            ulClientApp.Stop(simStopTime - Seconds(1.0));
+            uplinkClients.Add(ulClientApp);
+        }
+    }
+
+    // --- Visualization (NetAnim) ---
+    AnimationInterface anim("scenario-vanet-nr-fap-flood-detect.xml");
+    anim.EnablePacketMetadata(true);
+    for(uint32_t i=0; i<macroGnbNodes.GetN(); ++i)
+        anim.UpdateNodeColor(macroGnbNodes.Get(i), 255, 0, 0);
+
+    for(uint32_t i=0; i<fapNodes.GetN(); ++i)
+        anim.UpdateNodeColor(fapNodes.Get(i), 255, 0, 255);
+
+    anim.UpdateNodeColor(pgw, 128, 128, 128); anim.UpdateNodeColor(remoteHost, 0, 255, 0);
+    for (uint32_t i = 0; i < vehicles.GetN(); ++i) {
+         if (IsIndexInList(i, attackerUeIndices))
+         {
+            anim.UpdateNodeColor(vehicles.Get(i), 255, 165, 0);
+            anim.UpdateNodeDescription(vehicles.Get(i), "ATTACKER-" + std::to_string(i));
+        }
+         else if (IsIndexInList(i, fapLegitUeIndices))
+         {
+            anim.UpdateNodeColor(vehicles.Get(i), 0, 191, 255);
+            anim.UpdateNodeDescription(vehicles.Get(i), "FAP-LEGIT-" + std::to_string(i));
+        }
+         else
+         {
+            anim.UpdateNodeColor(vehicles.Get(i), 0, 0, 255);
+            anim.UpdateNodeDescription(vehicles.Get(i), "MACRO-LEGIT-" + std::to_string(i));
+        }
+    }
+    if(macroGnbNodes.GetN()>0) {
+        anim.UpdateNodeDescription(macroGnbNodes.Get(0), "Macro-gNB-1");
+    }
+    if(macroGnbNodes.GetN()>1) {
+        anim.UpdateNodeDescription(macroGnbNodes.Get(1), "Macro-gNB-2");
+    }
+    for(uint32_t i=0; i<fapNodes.GetN(); ++i)
+    {
+        anim.UpdateNodeDescription(fapNodes.Get(i), "FAP-" + std::to_string(i+1));
+    }
+    anim.UpdateNodeDescription(pgw, "PGW");
+    anim.UpdateNodeDescription(remoteHost, "RemoteHost");
+
+    // --- Simulation Execution & Analysis ---
+    FlowMonitorHelper flowHelper;
+    Ptr<FlowMonitor> flowMonitor;
+    flowMonitor = flowHelper.InstallAll();
+
+    std::string flowmonXmlFileName = "flow_stats.xml";
+    
+    std::cout << "FlowMonitor XML output configured to file: " << flowmonXmlFileName << std::endl;
+
+    std::cout << "\n--- Running Simulation (Duration: " << simStopTime.GetSeconds() << "s) ---" << std::endl;
+    std::cout << "--- FAP Uplink Radio/Buffer Flood Attack Period: " << ddosStartTime.GetSeconds() << "s to " << ddosStopTime.GetSeconds() << "s ---" << std::endl;
+    std::cout << "--- Attackers (Flooding Uplink): UEs ";
+    for(auto idx:attackerUeIndices)
+     std::cout << idx << " ";
+    std::cout << "---\n";
+    std::cout << "--- Legitimate UEs Near FAPs (Observe Impact): UEs ";
+    for(auto idx:fapLegitUeIndices)
+      std::cout << idx << " "; std::cout << "---\n";
+    flowMonitor->SerializeToXmlFile(flowmonXmlFileName, true, true);
+    Simulator::Stop(simStopTime);
+    Simulator::Run();
+    
+    std::cout << "--- Simulation Finished ---" << std::endl;
+
+    // --- Output Results ---
+    std::cout << "\n--- Vehicle (UE) IP Addresses ---\n";
+    for (uint32_t i = 0; i < vehicles.GetN(); i++)
+    {
+        Ptr<Ipv4> ipv4 = vehicles.Get(i)->GetObject<Ipv4>();
+        std::string role = "Macro-Legit";
+        if(IsIndexInList(i, attackerUeIndices))
+            role = "Attacker";
+        else if (IsIndexInList(i, fapLegitUeIndices))
+            role = "FAP-Legit";
+        if (ipv4->GetNInterfaces() > 1)
+        {
+            Ipv4Address ipAddr = ipv4->GetAddress(1, 0).GetLocal();
+            std::cout << "UE " << i << " (" << role << ") IP: " << ipAddr << std::endl;
+        } else
+        {
+            std::cout << "UE " << i << " (" << role << ") IP: Not found" << std::endl;
+        }
+    }
+    std::cout << "\n----------- Remote Host IP Address --------------\n";
+    Ptr<Ipv4> rh_ipv4 = remoteHost->GetObject<Ipv4>();
+    if (rh_ipv4->GetNInterfaces() > 1)
+    {
+        Ipv4Address rh_ipAddr = rh_ipv4->GetAddress(1, 0).GetLocal();
+        std::cout << "Remotehost IP: " << rh_ipAddr << std::endl;
+    } else
+    {
+        std::cout << "Remotehost IP: Not found" << std::endl;
+    }
+
+    flowMonitor->CheckForLostPackets();
+    Ptr<Ipv4FlowClassifier> classifier = DynamicCast<Ipv4FlowClassifier>(flowHelper.GetClassifier());
+    std::map<FlowId, FlowMonitor::FlowStats> stats = flowMonitor->GetFlowStats();
+    std::cout << "\n----------- Flow Monitor Statistics (Cumulative) ----------- \n";
+    for (auto const& [flowId, flowStats] : stats) {
+        Ipv4FlowClassifier::FiveTuple t = classifier->FindFlow(flowId);
+        std::string flowDesc = "Unknown";
+        bool isAttackFlow = false;
+        bool isImpactedLegitUl = false;
+        bool isOtherLegitUl = false;
+        bool srcIsAttacker = IsAddressInList(t.sourceAddress, ueIpIface, attackerUeIndices, vehicles);
+        bool srcIsFapLegit = IsAddressInList(t.sourceAddress, ueIpIface, fapLegitUeIndices, vehicles);
+        bool srcIsMacroLegit = IsAddressInList(t.sourceAddress, ueIpIface, macroLegitUeIndices, vehicles);
+        if (t.destinationAddress == remoteHostAddr && t.destinationPort == ulPort)
+        {
+            if (srcIsAttacker)
+            {
+                flowDesc = "Attacker UL Flood";
+                isAttackFlow = true;
+            } else if (srcIsFapLegit)
+            {
+                flowDesc = "FAP-Legit UL";
+                isImpactedLegitUl = true;
+            } else if (srcIsMacroLegit)
+            {
+                flowDesc = "Macro-Legit UL";
+                isOtherLegitUl = true;
+            } else
+            {
+                flowDesc = "Other UL";
+            }
+        }
+        else if (t.sourceAddress == remoteHostAddr && t.destinationPort == dlPort)
+        {
+            if (IsAddressInList(t.destinationAddress, ueIpIface, fapLegitUeIndices, vehicles))
+            {
+                flowDesc = "FAP-Legit DL";
+            } else if (IsAddressInList(t.destinationAddress, ueIpIface, macroLegitUeIndices, vehicles))
+            {
+                flowDesc = "Macro-Legit DL";
+            }
+            else
+            {
+                flowDesc = "Other DL";
+            }
+        }
+        std::cout << "Flow ID: " << flowId << " (" << flowDesc << ")";
+        std::cout << " Src: " << t.sourceAddress << ":" << t.sourcePort << " Dst: " << t.destinationAddress << ":" << t.destinationPort << std::endl;
+        std::cout << "  Tx Packets: " << flowStats.txPackets << " (" << flowStats.txBytes << " bytes)" << std::endl;
+        std::cout << "  Rx Packets: " << flowStats.rxPackets << " (" << flowStats.rxBytes << " bytes)" << std::endl;
+        std::cout << "  Lost Packets: " << flowStats.lostPackets << std::endl;
+        if (flowStats.txPackets > 0)
+        {
+            double lossRatio = (double)flowStats.lostPackets / flowStats.txPackets;
+            std::cout << "  Loss Ratio: " << std::fixed << std::setprecision(4) << lossRatio << std::endl;
+        }
+        if (flowStats.rxPackets > 0)
+        {
+            Time delaySum = flowStats.delaySum;
+            Time duration = flowStats.timeLastRxPacket - flowStats.timeFirstTxPacket;
+            std::cout << "  Mean Delay: " << (delaySum / flowStats.rxPackets).GetSeconds() << " s" << std::endl;
+            if (duration > Time(0))
+            {
+                std::cout << "  Throughput: " << (flowStats.rxBytes * 8.0 / duration.GetSeconds() / 1024) << " Kbps" << std::endl;
+            }
+            else
+            {
+                std::cout << "  Throughput: N/A (duration=0)" << std::endl;
+            }
+            if (flowStats.rxPackets > 1)
+            {
+                std::cout << "  Mean Jitter: " << (flowStats.jitterSum / (flowStats.rxPackets - 1)).GetSeconds() << " s" << std::endl;
+            }
+            else
+            {
+                std::cout << "  Mean Jitter: N/A (<= 1 Rx packet)" << std::endl;
+            }
+        }
+        else { std::cout << "  No Packets Received" << std::endl; }
+        std::cout << "------------------------------------------" << std::endl;
+    }
+
+    std::cout << "\n--- UE Connectivity Status (End of Simulation) ---\n";
+    for (uint32_t i = 0; i < vehicles.GetN(); ++i) {
+        Ptr<NetDevice> ueDev = vehicles.Get(i)->GetDevice(0);
+        Ptr<NrUeNetDevice> nrUeDev = DynamicCast<NrUeNetDevice>(ueDev);
+        std::cout << "UE " << i << " (Node ID: " << vehicles.Get(i)->GetId() << "): ";
+        if (nrUeDev)
+        {
+            uint16_t servingCellId = nrUeDev->GetCellId();
+            if (servingCellId != UINT16_MAX)
+            {
+                auto it = cellIdToNodeMap.find(servingCellId);
+                if (it != cellIdToNodeMap.end())
+                {
+                    Ptr<Node> servingNode = it->second; bool isMacro = false;
+                    for(uint32_t j=0; j < macroGnbNodes.GetN(); ++j)
+                    {
+                        if (macroGnbNodes.Get(j) == servingNode)
+                        {
+                            isMacro = true; break;
+                        }
+                    }
+                    std::cout << "Connected to Cell ID " << servingCellId << " (Node ID: " << servingNode->GetId() << ", Type: " << (isMacro ? "Macro gNB" : "FAP") << ")" << std::endl;
+                }
+                else
+                {
+                    std::cout << "Connected to Cell ID " << servingCellId << " (Node mapping not found!)" << std::endl;
+                }
+            }
+            else
+            {
+                std::cout << "Not connected (Reported Cell ID: 0x" << std::hex << servingCellId << std::dec << ")" << std::endl;
+            }
+        }
+        else
+        {
+            std::cout << "NR UE Device not found!" << std::endl;
+        }
+    }
+
+    Simulator::Destroy();
+    std::cout << "--- Simulation Destroyed ---" << std::endl;
+    return 0;
+}
